@@ -19,7 +19,9 @@ export function createChatServiceConfig(
     onRequest: (params: ChatRequestParams) => ({
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content: params.prompt ?? "" }),
+      body: JSON.stringify({
+        content: params.prompt ?? "",
+      }),
     }),
     onError: (err) => {
       console.error("[ChatStream] 请求失败:", err);

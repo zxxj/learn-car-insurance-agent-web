@@ -8,5 +8,7 @@ import { QuoteToolComponent } from "./components/QuoteCard";
 export const quoteTool: AgentToolcallConfig = {
   name: "quote",
   description: "保险方案报价",
+  parameters: [{ name: "licensePlate", type: "string" }],
+  handler: async (_args: unknown, backendResult: unknown) => backendResult,
   component: QuoteToolComponent,
 };

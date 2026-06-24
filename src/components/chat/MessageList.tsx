@@ -1,192 +1,211 @@
 /**
- * 消息列表 - 入场 stagger 动画 + 新消息监听 + 顶部加载更多
+ * 消息列表 - 基于 TDesign ChatList
  *
- * 滚动到顶部 → 触发 onLoadMore 回调(由 App 层拉更早历史)
- * prepend 之后必须修正 scrollTop,否则用户视觉上会跳到顶
+ * 职责收缩:
+ * - 滚动容器 + 自动滚到底(ChatList.autoScroll)
+ * - 滚动到顶触发加载更多(ChatList.onScroll)
+ * - 顶部 loading 指示(自定义,放 ChatList 之上)
+ * - 受控滚动 API(暴露 ref.scrollList)
+ * - 渲染每条消息 - 严格 TDesign,直接 <ChatMessage message={m} />
+ *
+ * 业务回调(比如 quote 卡片确认投保时,把文本作为用户消息发出)由 App 层在
+ * chatEngine 的 events 上订阅,而不是每条消息单独 onRespond。
  */
-import { useEffect, useMemo, useRef } from "react";
-import { gsap } from "gsap";
-import { ScrollTrigger } from "gsap/ScrollTrigger";
+import {
+  forwardRef,
+  useEffect,
+  useImperativeHandle,
+  useRef,
+  useState,
+} from "react";
+import { ChatList, ChatMessage, ToolCallRenderer } from "@tdesign-react/chat";
 import type { ChatMessagesData } from "@tdesign-react/chat";
-import { MessageBubble } from "./MessageBubble";
-
-gsap.registerPlugin(ScrollTrigger);
+import type { AIMessageContent, ToolCall } from "@tdesign-react/chat";
 
 interface MessageListProps {
   messages: ChatMessagesData[];
-  listRef: React.RefObject<HTMLDivElement | null>;
-  /** 滚动到顶时触发;返回 false 表示已无更多 */
+  /** 滚动到顶时触发;返回 Promise<void>,内部已做节流 */
   onLoadMore?: () => void | Promise<void>;
-  /** 是否正在加载更早历史 - 用来在顶部显示 loading 状态 */
+  /** 是否正在加载更早历史(顶部 loading 状态) */
   loadingMore?: boolean;
-  /** 是否还有更早历史 - 用来控制 sentinel 是否继续监听 */
+  /** 是否还有更早历史(顶部提示文案) */
   hasMore?: boolean;
 }
 
-const TOP_THRESHOLD_PX = 80; // 距顶 < 80px 算"到顶"
-const SCROLL_ADJUST_DEBOUNCE = 50; // ms
+/** 距顶 < 80px 算"到顶" */
+const TOP_THRESHOLD_PX = 80;
 
-export function MessageList({
-  messages,
-  listRef,
-  onLoadMore,
-  loadingMore = false,
-  hasMore = true,
-}: MessageListProps) {
-  const containerRef = useRef<HTMLDivElement | null>(null);
-  const loadingRef = useRef(false); // 用 ref 避免闭包陷阱
-  const scrollAnchorRef = useRef<{ top: number; height: number } | null>(null);
-
-  /**
-   * 按 id 去重 messages(保留首次出现)
-   * - 上游 chatEngine 在 "prepend" 模式下是直接 concat,不做去重
-   * - 后端 before= 可能是 inclusive,游标消息会在两批里都出现
-   * - AGUIAdapter.convertHistoryMessages 按用户轮次合并时也可能产生重复 id
-   * - 在 useEffect / 渲染 / 自动滚逻辑里全部用这份 deduped,避免 React duplicate key 警告,
-   *   也避免 auto-scroll 的 prevLastId / prevFirstId 被重复项污染
-   */
-  const dedupedMessages = useMemo(() => {
-    const seen = new Set<string>();
-    const out: ChatMessagesData[] = [];
-    for (const m of messages) {
-      if (!m?.id || seen.has(m.id)) continue;
-      seen.add(m.id);
-      out.push(m);
-    }
-    return out;
-  }, [messages]);
-
-  const prevCount = useRef(dedupedMessages.length);
-  const prevFirstId = useRef<string | undefined>(dedupedMessages[0]?.id);
-  const prevLastId = useRef<string | undefined>(
-    dedupedMessages[dedupedMessages.length - 1]?.id,
+function isToolCallContent(
+  content: AIMessageContent,
+): content is AIMessageContent & { data: ToolCall } {
+  return (
+    content.type === "toolcall" ||
+    (typeof content.type === "string" && content.type.startsWith("toolcall-"))
   );
+}
 
-  // 新消息入场动画 + 滚到底
-  // - 依赖 messages(不是 messages.length):streaming 时 content 不断更新,引用变,
-  //   useEffect 需要重跑才能把聊天锚到最底;只盯 length 会漏掉流式追加
-  // - 用首/末 id 区分 append(尾增) vs prepend(头增):
-  //   · append(发送 / 接收 / 流式) → 一定自动滚到底,跟 scrollAnchorRef 无关
-  //   · prepend(加载更早历史)     → 用 scrollAnchorRef 还原位置,不自动滚
-  // 之前用 `!scrollAnchorRef.current` 短路掉自动滚的写法有 bug:用户已经滚到顶部
-  // 准备发消息时 scrollAnchorRef 是 truthy,导致 append 也被吃掉不滚
-  useEffect(() => {
-    const firstId = dedupedMessages[0]?.id;
-    const lastId = dedupedMessages[dedupedMessages.length - 1]?.id;
-    const isAppend = lastId !== prevLastId.current;
-    const isPrepend =
-      !isAppend && firstId !== prevFirstId.current && dedupedMessages.length > 0;
-    const lengthIncreased = dedupedMessages.length > prevCount.current;
+type UserContentPart =
+  | { type: "text"; value: string }
+  | { type: "image"; alt: string; url: string };
 
-    if (lengthIncreased) {
-      const items =
-        containerRef.current?.querySelectorAll<HTMLElement>("[data-msg]");
-      if (items && items.length > 0) {
-        // 新增的可能在头部(prepend)或尾部(append),都做入场
-        const newItems = Array.from(items).filter((_, i) => {
-          // 简单做法:对所有 item 做一次淡入,已有动画的会被覆盖
-          return i >= prevCount.current;
-        });
-        if (newItems.length > 0) {
-          gsap.from(newItems, {
-            y: 16,
-            autoAlpha: 0,
-            duration: 0.6,
-            ease: "expo.out",
-            stagger: 0.04,
-            clearProps: "transform,opacity",
-          });
-        }
-      }
+const MARKDOWN_IMAGE_RE = /!\[([^\]\r\n]*)\]\((https?:\/\/[^)\s]+)\)/g;
+const HAS_MARKDOWN_IMAGE_RE = /!\[[^\]\r\n]*\]\(https?:\/\/[^)\s]+\)/;
+
+function parseUserContent(value: string): UserContentPart[] {
+  const parts: UserContentPart[] = [];
+  let lastIndex = 0;
+
+  for (const match of value.matchAll(MARKDOWN_IMAGE_RE)) {
+    const index = match.index ?? 0;
+    const text = value.slice(lastIndex, index).trim();
+    if (text) {
+      parts.push({ type: "text", value: text });
     }
-    prevCount.current = dedupedMessages.length;
-    prevFirstId.current = firstId;
-    prevLastId.current = lastId;
+    parts.push({
+      type: "image",
+      alt: match[1] || "image",
+      url: match[2],
+    });
+    lastIndex = index + match[0].length;
+  }
 
-    // prepend 后修正 scrollTop,避免视觉跳到顶
-    // - 真正的滚动容器是 listRef 指向的 App 层外层 div(它有 overflow-y-auto 和 bounded height)
-    // - containerRef 是内层,height:auto,不滚,所以不能用作滚动目标
-    if (isPrepend && scrollAnchorRef.current && listRef.current) {
-      const { top, height } = scrollAnchorRef.current;
-      const newHeight = listRef.current.scrollHeight;
-      const delta = newHeight - height;
-      listRef.current.scrollTop = top + delta;
-      scrollAnchorRef.current = null;
-    }
+  const rest = value.slice(lastIndex).trim();
+  if (rest) {
+    parts.push({ type: "text", value: rest });
+  }
 
-    // 自动滚到底 - 发送 / 接收 / 流式追加都触发
-    // - append: smooth,有动画感
-    // - 流式追加(content 变,id 不变): auto,紧跟内容往下走
-    if (isAppend) {
-      requestAnimationFrame(() => {
-        listRef.current?.scrollTo({
-          top: listRef.current.scrollHeight,
-          behavior: "smooth",
-        });
-      });
-    } else if (!scrollAnchorRef.current) {
-      // 流式追加(同一条消息 content 变)→ 紧跟滚到底
-      requestAnimationFrame(() => {
-        listRef.current?.scrollTo({
-          top: listRef.current.scrollHeight,
-          behavior: "auto",
-        });
-      });
-    }
-  }, [dedupedMessages, listRef]);
+  return parts;
+}
 
-  // 滚动监听 - 到顶触发加载更多
-  // - 滚动事件挂在外层滚动容器(listRef)上,内层 containerRef height:auto 不滚
-  useEffect(() => {
-    if (!onLoadMore || !hasMore) return;
-    const el = listRef.current;
-    if (!el) return;
+function getUserTextContent(message: ChatMessagesData): string {
+  if (message.role !== "user") return "";
+  return message.content
+    .filter((content) => content.type === "text")
+    .map((content) => content.data)
+    .join("\n\n");
+}
 
-    let timer: number | null = null;
-    const onScroll = () => {
-      if (loadingRef.current) return;
-      if (el.scrollTop <= TOP_THRESHOLD_PX) {
-        // 记录滚动锚点 - 用于 prepend 后还原
-        scrollAnchorRef.current = {
-          top: el.scrollTop,
-          height: el.scrollHeight,
-        };
-        // 节流
-        if (timer) window.clearTimeout(timer);
-        timer = window.setTimeout(() => {
-          loadingRef.current = true;
-          Promise.resolve(onLoadMore()).finally(() => {
-            // 延迟解锁,等 React 提交 DOM 完成
-            window.setTimeout(() => {
-              loadingRef.current = false;
-            }, SCROLL_ADJUST_DEBOUNCE);
-          });
-        }, 80);
-      }
-    };
+interface PreviewImage {
+  alt: string;
+  url: string;
+}
 
-    el.addEventListener("scroll", onScroll, { passive: true });
-    return () => {
-      el.removeEventListener("scroll", onScroll);
-      if (timer) window.clearTimeout(timer);
-    };
-  }, [onLoadMore, hasMore, listRef]);
+function UserMarkdownContent({
+  value,
+  onPreview,
+}: {
+  value: string;
+  onPreview: (image: PreviewImage) => void;
+}) {
+  const parts = parseUserContent(value);
+  const images = parts.filter((part) => part.type === "image");
+  const texts = parts
+    .filter((part) => part.type === "text")
+    .map((part) => part.value)
+    .join("\n\n");
 
   return (
     <div
-      ref={containerRef}
-      className="px-3 py-6 sm:px-5 sm:py-8 md:px-8 md:py-10"
+      slot="content"
+      className="user-md-content max-w-[min(78vw,520px)] rounded-[16px_16px_4px_16px] border border-[var(--border-subtle)] bg-[rgba(167,139,250,0.12)] px-3.5 py-3 shadow-[0_10px_28px_-18px_rgba(167,139,250,0.45)]"
     >
-      <div className="max-w-3xl mx-auto flex flex-col gap-5 sm:gap-7">
-        {/* 顶部加载状态指示 */}
+      {images.length > 0 && (
+        <div className="flex max-w-full gap-2 overflow-x-auto overflow-y-hidden pb-1">
+          {images.map((part, index) => (
+            <button
+              key={`image-${index}`}
+              type="button"
+              className="block h-28 w-28 shrink-0 cursor-zoom-in overflow-hidden rounded-xl border border-white/10 bg-black/20 p-0 sm:h-36 sm:w-36"
+              onClick={() => onPreview({ alt: part.alt, url: part.url })}
+              aria-label={`预览图片 ${part.alt}`}
+            >
+              <img
+                src={part.url}
+                alt={part.alt}
+                loading="lazy"
+                className="h-full w-full object-cover"
+              />
+            </button>
+          ))}
+        </div>
+      )}
+      {texts && (
+        <div className="mt-2 whitespace-pre-wrap break-words text-left text-[var(--text-primary)]">
+          {texts}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export const MessageList = forwardRef<unknown, MessageListProps>(
+  function MessageList({ messages, onLoadMore, loadingMore, hasMore }, ref) {
+    const innerRef = useRef<HTMLElement | null>(null);
+    const [previewImage, setPreviewImage] = useState<PreviewImage | null>(null);
+    const wasLoadingMoreRef = useRef(false);
+
+    useEffect(() => {
+      if (!previewImage) return;
+      const onKeyDown = (event: KeyboardEvent) => {
+        if (event.key === "Escape") setPreviewImage(null);
+      };
+      window.addEventListener("keydown", onKeyDown);
+      return () => window.removeEventListener("keydown", onKeyDown);
+    }, [previewImage]);
+
+    // 暴露 scrollList API 给外部(App 用作"发完消息滚到底")
+    useImperativeHandle(
+      ref,
+      () => ({
+        scrollList: (opt?: {
+          behavior?: "auto" | "smooth";
+          to?: "top" | "bottom";
+        }) => {
+          const el = innerRef.current as
+            | (HTMLElement & {
+                scrollList?: (o?: {
+                  behavior?: "auto" | "smooth";
+                  to?: "top" | "bottom";
+                }) => void;
+              })
+            | null;
+          el?.scrollList?.(opt);
+        },
+      }),
+      [],
+    );
+
+    useEffect(() => {
+      if (wasLoadingMoreRef.current && !loadingMore && hasMore) {
+        requestAnimationFrame(() => {
+          const el = innerRef.current as
+            | (HTMLElement & {
+                scrollTop?: number;
+                scrollList?: (o?: {
+                  behavior?: "auto" | "smooth";
+                  to?: "top" | "bottom";
+                }) => void;
+              })
+            | null;
+          if (typeof el?.scrollTop === "number" && el.scrollTop <= 2) {
+            el.scrollTop = TOP_THRESHOLD_PX + 24;
+          }
+        });
+      }
+      wasLoadingMoreRef.current = Boolean(loadingMore);
+    }, [loadingMore, hasMore]);
+
+    return (
+      <>
+        {/* 顶部 loading 状态条 - 放在 ChatList 之上,不被列表滚动影响 */}
         {(loadingMore || hasMore) && (
           <div
-            className="flex items-center justify-center gap-2 py-2 text-[11.5px] text-[var(--text-tertiary)] tracking-wider"
+            className="flex items-center justify-center gap-2 py-2 text-[11.5px] text-[--text-tertiary] tracking-wider"
             aria-live="polite"
           >
             {loadingMore ? (
               <>
-                <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent)] animate-pulse" />
+                <span className="w-1.5 h-1.5 rounded-full bg-[--accent] animate-pulse" />
                 <span>正在加载更早消息…</span>
               </>
             ) : hasMore ? (
@@ -197,14 +216,79 @@ export function MessageList({
           </div>
         )}
 
-        {dedupedMessages.map((m, idx) => (
-          <MessageBubble
-            key={m.id}
-            message={m}
-            isLast={idx === dedupedMessages.length - 1}
-          />
-        ))}
-      </div>
-    </div>
-  );
-}
+        <ChatList
+          ref={innerRef}
+          autoScroll
+          onScroll={(e) => {
+            if (!onLoadMore || !hasMore) return;
+            if (e.detail.scrollTop <= TOP_THRESHOLD_PX) {
+              void onLoadMore();
+            }
+          }}
+        >
+          {messages.map((m) => {
+            const isUser = m.role === "user";
+            const userText = getUserTextContent(m);
+            const hasUserMarkdownImage =
+              isUser && HAS_MARKDOWN_IMAGE_RE.test(userText);
+
+            return (
+              <ChatMessage
+                key={m.id}
+                message={m}
+                variant="base"
+                placement={isUser ? "right" : "left"}
+                name={isUser ? "我" : "季小保"}
+                actions={["copy", "replay", "good", "bad"]}
+              >
+                {hasUserMarkdownImage && (
+                  <UserMarkdownContent
+                    value={userText}
+                    onPreview={setPreviewImage}
+                  />
+                )}
+                {m.role === "assistant" &&
+                  m.content?.map((content, index) => {
+                    if (!isToolCallContent(content)) return null;
+
+                    return (
+                      <div
+                        key={`${m.id}-toolcall-${content.data.toolCallId}`}
+                        slot={`${content.type}-${index}`}
+                      >
+                        <ToolCallRenderer toolCall={content.data} />
+                      </div>
+                    );
+                  })}
+              </ChatMessage>
+            );
+          })}
+        </ChatList>
+        {previewImage && (
+          <div
+            className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/80 px-4 py-6"
+            role="dialog"
+            aria-modal="true"
+            aria-label="图片预览"
+            onClick={() => setPreviewImage(null)}
+          >
+            <button
+              type="button"
+              className="absolute right-4 top-4 flex h-9 w-9 items-center justify-center rounded-full border border-white/15 bg-black/40 text-xl leading-none text-white hover:bg-black/60"
+              onClick={() => setPreviewImage(null)}
+              aria-label="关闭预览"
+            >
+              ×
+            </button>
+            <img
+              src={previewImage.url}
+              alt={previewImage.alt}
+              className="max-h-[88vh] max-w-[92vw] rounded-xl object-contain shadow-2xl"
+              onClick={(event) => event.stopPropagation()}
+            />
+          </div>
+        )}
+      </>
+    );
+  },
+);

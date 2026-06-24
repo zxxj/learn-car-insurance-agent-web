@@ -1,11 +1,23 @@
 /**
  * App · 暗色 · 高级克制 · 强视觉首屏 · 多端响应
+ *
+ * 重构要点(对比上一版):
+ * - 删除 listRef / 滚动监听 / dedupedMessages → MessageList(基于 ChatList)自己处理
+ * - 删除 setMessages([], 'replace') → chatEngine.clearMessages()
+ * - 工具调用 fallback → useToolcallFallback(扫描 messages 自动注册未注册的工具)
+ * - Hero 卡片填充 → chatEngine.addPrompt(prompt)
+ * - 删除 HeroMaskLine / HeroCard 内的 GSAP 入场(refs)→ 改用 CSS @keyframes
+ * - 保留:侧栏 / 顶部 Header / GSAP 首屏遮罩 / 历史消息分页 / quote 事件总线
  */
 import { useEffect, useRef, useState, useMemo } from "react";
 import { gsap } from "gsap";
 import { ScrollTrigger } from "gsap/ScrollTrigger";
 import { useChat, AGUIAdapter } from "@tdesign-react/chat";
-import type { ChatMessagesData } from "@tdesign-react/chat";
+import type {
+  AttachmentItem,
+  ChatMessagesData,
+  TdAttachmentItem,
+} from "@tdesign-react/chat";
 
 import {
   createChatServiceConfig,
@@ -16,7 +28,7 @@ import type { AGUIHistoryMessage } from "./api";
 
 /** 首次 / 每次"加载更多"的历史消息条数 */
 const HISTORY_PAGE_SIZE = 10;
-import { useTools } from "./tools";
+import { useTools, useToolcallFallback } from "./tools";
 import { quoteEvents } from "./tools/quoteEvents";
 
 import { Sidebar } from "./components/layout/Sidebar";
@@ -30,8 +42,166 @@ gsap.registerPlugin(ScrollTrigger);
 const THREAD_ID = "2";
 const LG_BREAKPOINT = 1024;
 
+type HistoryMessageWithAttachments = AGUIHistoryMessage & {
+  attachments?: AttachmentItem[];
+};
+
+type ResponseHistoryRecord = {
+  id?: number | string;
+  input?: Array<{
+    role?: string;
+    content?: string;
+  }> | null;
+  output?: Array<{
+    type?: string;
+    role?: string;
+    content?: Array<{
+      type?: string;
+      text?: string;
+    }>;
+  }> | null;
+  created_at?: number | string;
+};
+
+function inferAttachmentType(item: TdAttachmentItem): AttachmentItem["fileType"] {
+  const source = `${item.fileType ?? ""} ${item.name ?? ""} ${item.url ?? ""}`;
+  if (/\.pdf\b|pdf/i.test(source)) return "pdf";
+  if (/\.(doc|docx)\b|word/i.test(source)) return "doc";
+  if (/\.(ppt|pptx)\b|powerpoint/i.test(source)) return "ppt";
+  if (/\.(mp3|wav|aac|ogg)\b|audio/i.test(source)) return "audio";
+  if (/\.(mp4|mov|webm|avi)\b|video/i.test(source)) return "video";
+  if (/\.(txt|md|csv|json)\b|text/i.test(source)) return "txt";
+  return "image";
+}
+
+function toAttachmentItem(item: TdAttachmentItem): AttachmentItem {
+  return {
+    fileType: inferAttachmentType(item),
+    name: item.name,
+    url: item.url,
+    size: item.size,
+    extension: item.extension,
+  };
+}
+
+function toMarkdownImage(item: AttachmentItem): string {
+  const alt = (item.name || "image").replace(/[\[\]\n\r]/g, " ").trim();
+  return `![${alt}](${item.url})`;
+}
+
+function toDatetime(value: ResponseHistoryRecord["created_at"]): string {
+  if (typeof value === "number") {
+    return new Date(value * 1000).toISOString();
+  }
+  if (typeof value === "string") {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric)) {
+      return new Date(numeric * 1000).toISOString();
+    }
+  }
+  return new Date().toISOString();
+}
+
+function convertResponseHistoryRecords(
+  history: ResponseHistoryRecord[],
+): ChatMessagesData[] {
+  const messages: ChatMessagesData[] = [];
+
+  history.forEach((record) => {
+    record.input?.forEach((input, index) => {
+      if (input.role !== "user" || !input.content) return;
+      messages.push({
+        id: `history-${record.id ?? messages.length}-user-${index}`,
+        role: "user",
+        status: "complete",
+        datetime: toDatetime(record.created_at),
+        content: [
+          {
+            type: "text",
+            data: input.content,
+          },
+        ],
+      });
+    });
+
+    record.output?.forEach((output, outputIndex) => {
+      if (output.type !== "message" && output.role !== "assistant") return;
+      const text = output.content
+        ?.filter((content) => content.type === "output_text" && content.text)
+        .map((content) => content.text)
+        .join("\n\n");
+      if (!text) return;
+
+      messages.push({
+        id: `history-${record.id ?? messages.length}-assistant-${outputIndex}`,
+        role: "assistant",
+        status: "complete",
+        datetime: toDatetime(record.created_at),
+        content: [
+          {
+            type: "markdown",
+            data: text,
+          },
+        ],
+      });
+    });
+  });
+
+  return messages;
+}
+
+function convertHistoryMessages(
+  history: AGUIHistoryMessage[],
+): ChatMessagesData[] {
+  const responseRecords = history as unknown as ResponseHistoryRecord[];
+  if (
+    responseRecords.some(
+      (message) =>
+        Array.isArray(message.input) || Array.isArray(message.output),
+    )
+  ) {
+    return convertResponseHistoryRecords(responseRecords);
+  }
+
+  const converted = AGUIAdapter.convertHistoryMessages(
+    history,
+  ) as ChatMessagesData[];
+  const attachmentsByMessageId = new Map<string, AttachmentItem[]>();
+
+  history.forEach((message) => {
+    if (message.role !== "user") return;
+    if (!message.id) return;
+    const attachments = (message as HistoryMessageWithAttachments).attachments;
+    if (Array.isArray(attachments) && attachments.length > 0) {
+      attachmentsByMessageId.set(message.id, attachments);
+    }
+  });
+
+  if (attachmentsByMessageId.size === 0) return converted;
+
+  return converted.map((message) => {
+    if (message.role !== "user") return message;
+    const historyAttachments = attachmentsByMessageId.get(message.id);
+    if (!historyAttachments?.length) return message;
+    const hasAttachmentContent = message.content.some(
+      (content) => content.type === "attachment",
+    );
+    if (hasAttachmentContent) return message;
+
+    return {
+      ...message,
+      content: [
+        ...message.content,
+        {
+          type: "attachment",
+          data: historyAttachments,
+        },
+      ],
+    };
+  });
+}
+
 export default function App() {
-  const listRef = useRef<HTMLDivElement | null>(null);
   const [inputValue, setInputValue] = useState("");
   const [initialMessages, setInitialMessages] = useState<ChatMessagesData[]>(
     [],
@@ -48,6 +218,12 @@ export default function App() {
   const [hasMoreHistory, setHasMoreHistory] = useState(true);
   /** 是否正在加载更早历史(防止重复触发) */
   const [loadingMore, setLoadingMore] = useState(false);
+  /**
+   * 输入区已选附件 - 由 Composer 维护上传状态,通过 attachmentsProps.items 渲染 chip
+   * 发送时筛 status='success' 的项,把 url 数组塞给 chatEngine.sendUserMessage.attachments
+   * setter 兼容函数式 updater:并发上传场景下,Composer 用 prev => ... 避免闭包读到旧 state
+   */
+  const [attachments, setAttachments] = useState<TdAttachmentItem[]>([]);
 
   useTools();
 
@@ -79,17 +255,14 @@ export default function App() {
     fetchHistoryMessages(THREAD_ID, { limit: HISTORY_PAGE_SIZE })
       .then((history: AGUIHistoryMessage[]) => {
         if (cancelled) return;
-        const converted = AGUIAdapter.convertHistoryMessages(
-          history,
-        ) as ChatMessagesData[];
+        const converted = convertHistoryMessages(history);
         setInitialMessages(converted);
-        // 推断是否还有更早历史
         if (history.length < HISTORY_PAGE_SIZE) {
           setHasMoreHistory(false);
         }
-        // 游标 = 当前最早一条的 id
+        // cursor = 本次返回的第一条 id(后端用它翻下一页更早的历史)
         const firstRaw = history[0];
-        if (firstRaw?.id) setHistoryCursor(firstRaw.id);
+        if (firstRaw?.id) setHistoryCursor(String(firstRaw.id));
       })
       .catch((err) => {
         console.error("[HistoryMessages] 加载失败:", err);
@@ -100,54 +273,42 @@ export default function App() {
   }, []);
 
   /**
-   * 加载更早历史(滚动到顶时触发)
-   * - 用 historyCursor 做游标分页(before=<id>&limit=10)
-   * - 新消息用 setMessages("prepend") 插到列表前面
-   * - 保留当前滚动位置(MessageList 监听 scrollAnchorRef 自动修正)
-   *
-   * **重要:后端 before= 可能是包含游标的(inclusive),同一 id 会在两批里都出现;
-   * 此外 AGUIAdapter.convertHistoryMessages 会按"用户轮次"合并消息,如果原始数据中
-   * 同一轮里有重复 id,转换后也会重复。而 TDesign 的 MessageStore.setMessages
-   * "prepend" 模式是直接 [...new, ...old] 拼接,不做去重 → 触发 React duplicate key 警告。
-   * 所以这里在 push 进 chatEngine 前先按 id 去重。**
+   * 加载更早历史 - 在推入 chatEngine 前先按 id 去重
+   * (TDesign 内部 setMessages 'prepend' 是直接 concat,不去重)
+   * 用 messageStore.getState() 读最新快照,避免 React state 异步问题
    */
   const handleLoadMoreHistory = async () => {
     if (loadingMore || !hasMoreHistory || !historyCursor) return;
     setLoadingMore(true);
     try {
       const older = await fetchHistoryMessages(THREAD_ID, {
-        before: historyCursor,
+        cursor: historyCursor,
         limit: HISTORY_PAGE_SIZE,
       });
       if (older.length === 0) {
         setHasMoreHistory(false);
         return;
       }
-      const converted = AGUIAdapter.convertHistoryMessages(
-        older,
-      ) as ChatMessagesData[];
+      const converted = convertHistoryMessages(older);
 
-      // 用 messages 拿当前 chatEngine 的真实快照 - 注意:此处从 useChat 来的
-      // `messages` 是异步同步的 React state,在 await 期间可能不是最新;
-      // 用 chatEngine.messageStore.getState() 直接读 store 更可靠。
-      // MessageStore 暴露了 getState(),内部 shape = { messageIds, messages, ... }
       const storeState = chatEngine.messageStore.getState() as {
         messages: ChatMessagesData[];
       };
       const existingIds = new Set(storeState.messages.map((m) => m.id));
       const deduped = converted.filter((m) => !existingIds.has(m.id));
 
-      // 整批都是重复 → 后端在原地兜圈,视为已无更多
+      // 继续翻页:cursor 取本次第一条 id
+      const firstRaw = older[0];
+      if (firstRaw?.id) setHistoryCursor(String(firstRaw.id));
+
       if (deduped.length === 0) {
-        setHasMoreHistory(false);
+        if (older.length < HISTORY_PAGE_SIZE) {
+          setHasMoreHistory(false);
+        }
         return;
       }
 
       chatEngine.setMessages(deduped, "prepend");
-      // 推下游标 - 用转换后的最前一条的 id(后续 before 仍按原 cursor 走也行,
-      // 但用转换后的 id 更准确反映 chatEngine 视图)
-      const firstConverted = deduped[0];
-      if (firstConverted?.id) setHistoryCursor(firstConverted.id);
       if (older.length < HISTORY_PAGE_SIZE) {
         setHasMoreHistory(false);
       }
@@ -168,10 +329,14 @@ export default function App() {
     chatServiceConfig,
   });
 
+  const [showHero, setShowHero] = useState(true);
+
+  // 给未注册的 toolcall 自动注册 fallback badge
+  useToolcallFallback(messages);
+
   useEffect(() => {
     if (initialMessages.length > 0) {
       chatEngine.setMessages(initialMessages, "replace");
-      // 加载到历史消息 → 切到聊天列表,Hero 隐藏
       setShowHero(false);
     }
   }, [initialMessages, chatEngine]);
@@ -181,20 +346,11 @@ export default function App() {
     [status],
   );
 
-  /**
-   * Hero(推荐问题)显隐 - 独立 state 驱动
-   * - 不直接依赖 messages.length,因为 chatEngine.setMessages 的回填是 microtask 异步的,
-   *   在 async handleClear 里 + 多次 setState 混合时,React 18 的批处理有时不会触发
-   *   messages → [] 的同步更新,导致 showHero 短暂/永久不到 true
-   * - 显式 setShowHero(true) 比"等 messages 自己变空"更可靠
-   */
-  const [showHero, setShowHero] = useState(true);
-
   // 报价卡片点击确认 → 把"我确认投保XXX"作为用户消息发出
   useEffect(() => {
     return quoteEvents.subscribe((text) => {
       if (senderLoading) return;
-      setShowHero(false); // 报价卡片确认投保后,Hero 隐藏
+      setShowHero(false);
       void chatEngine.sendUserMessage({ prompt: text });
     });
   }, [chatEngine, senderLoading]);
@@ -218,6 +374,8 @@ export default function App() {
   const headerRef = useRef<HTMLDivElement>(null);
   const heroRef = useRef<HTMLDivElement>(null);
 
+  // 首屏入场动画:上下遮罩先盖住整个屏幕,再分别向两侧滑开(顶部上滑、底部下滑),
+// header/composer 同步淡入上移,标题 mask 上推,orbs 渐显。
   useEffect(() => {
     if (typeof window === "undefined") return;
     const reduceMotion = window.matchMedia(
@@ -330,9 +488,6 @@ export default function App() {
 
   /**
    * Hero 内容入场 - 每次 showHero 变 true 都跑一遍
-   * 原因:首屏 GSAP 动画只跑一次 (`[]` deps),Hero 重渲染(清空消息后)
-   * 不会被重新触发,而 HeroCard 自带 `.reveal` (opacity:0),导致盒子在,
-   * 但内容不可见。
    */
   useEffect(() => {
     if (!showHero) return;
@@ -344,7 +499,7 @@ export default function App() {
       cardBRef.current,
       cardCRef.current,
       cardDRef.current,
-    ].filter((el): el is HTMLElement => Boolean(el));
+    ].filter(Boolean) as HTMLElement[];
 
     const ctx = gsap.context(() => {
       gsap.fromTo(
@@ -388,10 +543,25 @@ export default function App() {
   // 事件
   // =========================================================
   const handleSend = async (message: string) => {
-    if (!message.trim() || senderLoading) return;
+    if (senderLoading) return;
+    // 筛选成功上传的附件 - TdAttachmentItem(显示用) → AttachmentItem(发送用)
+    // 类型映射:fileType/name/url 直传,size/extension 可选
+    const readyAttachments = attachments
+      .filter((it) => it.status === "success" && it.url)
+      .map(toAttachmentItem);
+    const prompt = message.trim();
+    if (!prompt && readyAttachments.length === 0) return;
+    const imageMarkdown = readyAttachments
+      .filter((it) => it.fileType === "image" && it.url)
+      .map(toMarkdownImage);
+    const content = [prompt, ...imageMarkdown].filter(Boolean).join("\n\n");
+
     setInputValue("");
-    setShowHero(false); // 发了消息,Hero 隐藏
-    await chatEngine.sendUserMessage({ prompt: message });
+    setAttachments([]);
+    setShowHero(false);
+    await chatEngine.sendUserMessage({
+      prompt: content,
+    });
   };
 
   const handleClear = async () => {
@@ -399,8 +569,8 @@ export default function App() {
     try {
       await clearHistoryMessages();
       setInitialMessages([]);
-      chatEngine.setMessages([], "replace");
-      setShowHero(true); // 清空后立即显示推荐问题,不依赖 messages 异步回填
+      chatEngine.clearMessages();
+      setShowHero(true);
     } catch (err) {
       console.error("[ClearMessages] 清空失败:", err);
       window.alert("清空失败，请重试");
@@ -408,9 +578,17 @@ export default function App() {
   };
 
   const handleNewChat = () => {
-    // if (messages.length === 0) return;
-    // handleClear();
     window.confirm("待开发.");
+  };
+
+  /**
+   * Hero 卡片点击 → 把 prompt 写入输入框
+   * 严格 TDesign:用受控 inputValue prop 同步给 ChatSender
+   * (chatEngine 没有 addPrompt,只有 ChatBot 组件实例才有)
+   */
+  const handleHeroClick = (prompt: string) => {
+    setInputValue(prompt);
+    setShowHero(false);
   };
 
   return (
@@ -480,133 +658,99 @@ export default function App() {
         </div>
 
         {/* Hero / 消息列表 二选一,占据中间空间,超出可滚
-            - 真正的滚动容器在这层,MessageList 内部不再有 overflow-y-auto
-            - listRef 挂这里,MessageList 收到的 listRef 指向这层,scrollTo / 滚动监听都走这层 */}
-        <div ref={listRef} className="flex-1 min-h-0 overflow-y-auto">
-          {showHero ? (
-            <div
-              ref={heroRef}
-              className="px-4 pt-7 pb-5 sm:px-6 sm:pt-12 sm:pb-8 md:px-10 md:pt-16 md:pb-12 max-w-3xl mx-auto"
-            >
-              <div ref={pillRef} className="mb-6 sm:mb-8">
-                <span className="pill">
-                  <span className="dot" />
-                  <span>Ready · 与 AI 协作</span>
-                </span>
-              </div>
-
-              <h1 className="text-[clamp(1.85rem,7vw,4rem)] font-semibold leading-[1.12] tracking-[-0.035em] mb-5 sm:mb-8">
-                <HeroMaskLine ref={titleLine1Ref}>
-                  <span className="text-[var(--text-primary)]">与</span>{" "}
-                  <span className="text-gradient">季小保</span>{" "}
-                  <span className="text-[var(--text-primary)]">对话,</span>
-                </HeroMaskLine>
-                <HeroMaskLine ref={titleLine2Ref}>
-                  <span className="text-[var(--text-primary)]">
-                    让每个想法都更清晰。
-                  </span>
-                </HeroMaskLine>
-              </h1>
-
-              <p
-                ref={subtitleRef}
-                className="text-[14px] sm:text-[15px] text-[var(--text-secondary)] leading-[1.75] max-w-xl mb-8 sm:mb-12"
-              >
-                一个克制、专注、值得信赖的 AI 工作伙伴。
-                提问、思考、创造,从此处开始。
-              </p>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
-                <HeroCard
-                  ref={cardARef}
-                  title="解释 RAG"
-                  desc="用通俗语言讲清检索增强生成的原理"
-                  icon={
-                    <svg
-                      width="16"
-                      height="16"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="1.6"
-                    >
-                      <path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20" />
-                    </svg>
-                  }
-                  onClick={() => setInputValue("解释一下什么是 RAG?")}
-                />
-                <HeroCard
-                  ref={cardBRef}
-                  title="撰写客户邮件"
-                  desc="按你给的语气与上下文起草正式回复"
-                  icon={
-                    <svg
-                      width="16"
-                      height="16"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="1.6"
-                      strokeLinecap="round"
-                    >
-                      <rect width="20" height="16" x="2" y="4" rx="2" />
-                      <path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7" />
-                    </svg>
-                  }
-                  onClick={() => setInputValue("帮我写一封客户跟进邮件")}
-                />
-                <HeroCard
-                  ref={cardCRef}
-                  title="本周工作计划"
-                  desc="按目标拆解可执行清单与时间分配"
-                  icon={
-                    <svg
-                      width="16"
-                      height="16"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="1.6"
-                      strokeLinecap="round"
-                    >
-                      <rect x="3" y="4" width="18" height="18" rx="2" />
-                      <path d="M16 2v4M8 2v4M3 10h18" />
-                    </svg>
-                  }
-                  onClick={() => setInputValue("帮我安排本周工作计划")}
-                />
-                <HeroCard
-                  ref={cardDRef}
-                  title="推荐一本书"
-                  desc="根据你最近关注的话题,挑一本值得读的"
-                  icon={
-                    <svg
-                      width="16"
-                      height="16"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="1.6"
-                      strokeLinecap="round"
-                    >
-                      <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" />
-                      <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" />
-                    </svg>
-                  }
-                  onClick={() => setInputValue("推荐一本值得读的产品书")}
-                />
-              </div>
+            - 真正的滚动容器在 MessageList 内部(ChatList.autoScroll)
+            - 删除了旧版的 listRef + 外层 overflow-y-auto 包装 */}
+        {showHero ? (
+          <div
+            ref={heroRef}
+            className="flex-1 min-h-0 overflow-y-auto px-4 pt-7 pb-5 sm:px-6 sm:pt-12 sm:pb-8 md:px-10 md:pt-16 md:pb-12 max-w-3xl mx-auto"
+          >
+            <div ref={pillRef} className="mb-6 sm:mb-8">
+              <span className="pill">
+                <span className="dot" />
+                <span>Ready · 与 AI 协作</span>
+              </span>
             </div>
-          ) : (
-            <MessageList
-              messages={messages}
-              listRef={listRef}
-              onLoadMore={handleLoadMoreHistory}
-              loadingMore={loadingMore}
-              hasMore={hasMoreHistory}
-            />
-          )}
-        </div>
+
+            <h1 className="text-[clamp(1.85rem,7vw,4rem)] font-semibold leading-[1.12] tracking-[-0.035em] mb-5 sm:mb-8">
+              <HeroMaskLine ref={titleLine1Ref}>
+                <span className="text-[var(--text-primary)]">与</span>{" "}
+                <span className="text-gradient">季小保</span>{" "}
+                <span className="text-[var(--text-primary)]">对话,</span>
+              </HeroMaskLine>
+              <HeroMaskLine ref={titleLine2Ref}>
+                <span className="text-[var(--text-primary)]">
+                  让每个想法都更清晰。
+                </span>
+              </HeroMaskLine>
+            </h1>
+
+            <p
+              ref={subtitleRef}
+              className="text-[14px] sm:text-[15px] text-[var(--text-secondary)] leading-[1.75] max-w-xl mb-8 sm:mb-12"
+            >
+              一个克制、专注、值得信赖的 AI 工作伙伴。
+              提问、思考、创造,从此处开始。
+            </p>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
+              <HeroCard
+                ref={cardARef}
+                title="解释 RAG"
+                desc="用通俗语言讲清检索增强生成的原理"
+                icon={
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6">
+                    <path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20" />
+                  </svg>
+                }
+                onClick={() => handleHeroClick("解释一下什么是 RAG?")}
+              />
+              <HeroCard
+                ref={cardBRef}
+                title="撰写客户邮件"
+                desc="按你给的语气与上下文起草正式回复"
+                icon={
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
+                    <rect width="20" height="16" x="2" y="4" rx="2" />
+                    <path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7" />
+                  </svg>
+                }
+                onClick={() => handleHeroClick("帮我写一封客户跟进邮件")}
+              />
+              <HeroCard
+                ref={cardCRef}
+                title="本周工作计划"
+                desc="按目标拆解可执行清单与时间分配"
+                icon={
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
+                    <rect x="3" y="4" width="18" height="18" rx="2" />
+                    <path d="M16 2v4M8 2v4M3 10h18" />
+                  </svg>
+                }
+                onClick={() => handleHeroClick("帮我安排本周工作计划")}
+              />
+              <HeroCard
+                ref={cardDRef}
+                title="推荐一本书"
+                desc="根据你最近关注的话题,挑一本值得读的"
+                icon={
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
+                    <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" />
+                    <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" />
+                  </svg>
+                }
+                onClick={() => handleHeroClick("推荐一本值得读的产品书")}
+              />
+            </div>
+          </div>
+        ) : (
+          <MessageList
+            messages={messages}
+            onLoadMore={handleLoadMoreHistory}
+            loadingMore={loadingMore}
+            hasMore={hasMoreHistory}
+          />
+        )}
 
         {/* Composer 永远固定在底部 */}
         <div
@@ -619,6 +763,8 @@ export default function App() {
             onChange={setInputValue}
             onSend={handleSend}
             onStop={() => chatEngine.abortChat()}
+            attachments={attachments}
+            onAttachmentsChange={setAttachments}
           />
           <div className="max-w-3xl mx-auto mt-2 sm:mt-2.5 hidden sm:flex items-center justify-center gap-1.5 text-[10.5px] text-[var(--text-tertiary)] tracking-wider uppercase">
             <span>季小保可能会犯错 · 请核查重要信息</span>
@@ -626,7 +772,7 @@ export default function App() {
         </div>
       </main>
 
-      {/* 顶部 + 底部开场遮罩 */}
+      {/* 顶部 + 底部开场遮罩(开场动画期间盖住屏幕,然后各自滑出) */}
       <div
         ref={maskTopRef}
         aria-hidden
