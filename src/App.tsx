@@ -30,6 +30,108 @@ gsap.registerPlugin(ScrollTrigger);
 const THREAD_ID = "2";
 const LG_BREAKPOINT = 1024;
 
+/**
+ * 后端 /messages 返回的每条记录结构(input/output 数组)
+ * 与标准 AG-UI 消息格式不同,需要单独转换。
+ */
+type ResponseHistoryRecord = {
+  id?: number | string;
+  input?: Array<{
+    role?: string;
+    content?: string;
+  }> | null;
+  output?: Array<{
+    type?: string;
+    role?: string;
+    content?: Array<{
+      type?: string;
+      text?: string;
+    }>;
+  }> | null;
+  created_at?: number | string;
+};
+
+function toDatetime(value: ResponseHistoryRecord["created_at"]): string {
+  if (typeof value === "number") {
+    return new Date(value * 1000).toISOString();
+  }
+  if (typeof value === "string") {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric)) {
+      return new Date(numeric * 1000).toISOString();
+    }
+  }
+  return new Date().toISOString();
+}
+
+function convertResponseHistoryRecords(
+  history: ResponseHistoryRecord[],
+): ChatMessagesData[] {
+  const messages: ChatMessagesData[] = [];
+
+  history.forEach((record) => {
+    record.input?.forEach((input, index) => {
+      if (input.role !== "user" || !input.content) return;
+      messages.push({
+        id: `history-${record.id ?? messages.length}-user-${index}`,
+        role: "user",
+        status: "complete",
+        datetime: toDatetime(record.created_at),
+        content: [
+          {
+            type: "text",
+            data: input.content,
+          },
+        ],
+      });
+    });
+
+    record.output?.forEach((output, outputIndex) => {
+      if (output.type !== "message" && output.role !== "assistant") return;
+      const text = output.content
+        ?.filter((content) => content.type === "output_text" && content.text)
+        .map((content) => content.text)
+        .join("\n\n");
+      if (!text) return;
+
+      messages.push({
+        id: `history-${record.id ?? messages.length}-assistant-${outputIndex}`,
+        role: "assistant",
+        status: "complete",
+        datetime: toDatetime(record.created_at),
+        content: [
+          {
+            type: "markdown",
+            data: text,
+          },
+        ],
+      });
+    });
+  });
+
+  return messages;
+}
+
+/**
+ * 历史消息转换入口
+ * - 如果某条记录带 input/output 数组 → 视为后端原始结构,用 convertResponseHistoryRecords
+ * - 否则视为标准 AG-UI 格式,走 AGUIAdapter
+ */
+function convertHistoryMessages(
+  history: AGUIHistoryMessage[],
+): ChatMessagesData[] {
+  const responseRecords = history as unknown as ResponseHistoryRecord[];
+  if (
+    responseRecords.some(
+      (message) =>
+        Array.isArray(message.input) || Array.isArray(message.output),
+    )
+  ) {
+    return convertResponseHistoryRecords(responseRecords);
+  }
+  return AGUIAdapter.convertHistoryMessages(history) as ChatMessagesData[];
+}
+
 export default function App() {
   const listRef = useRef<HTMLDivElement | null>(null);
   const [inputValue, setInputValue] = useState("");
@@ -79,9 +181,7 @@ export default function App() {
     fetchHistoryMessages(THREAD_ID, { limit: HISTORY_PAGE_SIZE })
       .then((history: AGUIHistoryMessage[]) => {
         if (cancelled) return;
-        const converted = AGUIAdapter.convertHistoryMessages(
-          history,
-        ) as ChatMessagesData[];
+        const converted = convertHistoryMessages(history);
         setInitialMessages(converted);
         // 推断是否还有更早历史
         if (history.length < HISTORY_PAGE_SIZE) {
@@ -123,9 +223,7 @@ export default function App() {
         setHasMoreHistory(false);
         return;
       }
-      const converted = AGUIAdapter.convertHistoryMessages(
-        older,
-      ) as ChatMessagesData[];
+      const converted = convertHistoryMessages(older);
 
       // 用 messages 拿当前 chatEngine 的真实快照 - 注意:此处从 useChat 来的
       // `messages` 是异步同步的 React state,在 await 期间可能不是最新;
@@ -144,10 +242,14 @@ export default function App() {
       }
 
       chatEngine.setMessages(deduped, "prepend");
-      // 推下游标 - 用转换后的最前一条的 id(后续 before 仍按原 cursor 走也行,
-      // 但用转换后的 id 更准确反映 chatEngine 视图)
-      const firstConverted = deduped[0];
-      if (firstConverted?.id) setHistoryCursor(firstConverted.id);
+      // 推下游标 - 必须用后端原始记录的 id, 不能用 convertHistoryMessages
+      // 生成的虚拟 id(如 history-52-user-0), 否则后端不认 → 422。
+      const firstRaw = older[0] as unknown as ResponseHistoryRecord;
+      if (firstRaw?.id !== undefined) {
+        setHistoryCursor(String(firstRaw.id));
+      } else {
+        setHasMoreHistory(false);
+      }
       if (older.length < HISTORY_PAGE_SIZE) {
         setHasMoreHistory(false);
       }

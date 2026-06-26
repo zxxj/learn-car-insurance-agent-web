@@ -117,14 +117,19 @@ export function MessageList({
     // 自动滚到底 - 发送 / 接收 / 流式追加都触发
     // - append: smooth,有动画感
     // - 流式追加(content 变,id 不变): auto,紧跟内容往下走
-    if (isAppend) {
+    // - prepend: 上面的 block 已经把 scrollTop 还原,这里不要再滚到底
+    //   (旧代码用 `!scrollAnchorRef.current` 判断, 但 prepend 还原时 ref 已经被置 null,
+    //   导致 else-if 误触发 → 滚到底,体验极差)
+    if (isPrepend) {
+      // 已在上方还原, 什么都不做
+    } else if (isAppend) {
       requestAnimationFrame(() => {
         listRef.current?.scrollTo({
           top: listRef.current.scrollHeight,
           behavior: "smooth",
         });
       });
-    } else if (!scrollAnchorRef.current) {
+    } else {
       // 流式追加(同一条消息 content 变)→ 紧跟滚到底
       requestAnimationFrame(() => {
         listRef.current?.scrollTo({

@@ -33,8 +33,11 @@ export interface RequestOptions extends Omit<
 /** 共享 axios 实例(供需要绕过 http() 默认头的场景直接使用, 如文件上传) */
 export const instance: AxiosInstance = axios.create({
   timeout: 30_000,
+  // 注意: 这里不设 Content-Type。axios 的默认 transformRequest 看到
+  // Content-Type: application/json + FormData 时, 会把 FormData 转成 JSON
+  // 发出去(导致 422)。http() 自己显式设了 JSON, 文件上传走 FormData 时
+  // 由 axios/浏览器自动补 multipart/form-data; boundary。
   headers: {
-    "Content-Type": "application/json",
     Accept: "application/json",
   },
 });
