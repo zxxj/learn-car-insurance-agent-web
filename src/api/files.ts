@@ -1,4 +1,4 @@
-import { HttpError } from "./http";
+import { instance, HttpError } from "./http";
 
 export const FILES_ENDPOINTS = {
   upload: "/files",
@@ -8,45 +8,22 @@ export interface UploadResponse {
   url: string;
 }
 
+/** 上传文件(FormData), 60s 超时; 返回后端给出的可访问 URL */
 export async function uploadFile(file: File): Promise<string> {
   const formData = new FormData();
   formData.append("file", file);
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 60_000);
+  // 走底层 instance(不走 http() 是为了不强制 application/json 头,
+  // 且需要独立超时); 错误仍由响应拦截器统一转 HttpError
+  // 注意: FormData 不要手动设 Content-Type, axios 会自动加 boundary
+  const { data } = await instance.post<UploadResponse>(
+    FILES_ENDPOINTS.upload,
+    formData,
+    { timeout: 60_000 },
+  );
 
-  try {
-    const response = await fetch(FILES_ENDPOINTS.upload, {
-      method: "POST",
-      body: formData,
-      signal: controller.signal,
-    });
-
-    if (!response.ok) {
-      const text = await response.text();
-      let data: unknown;
-      try {
-        data = JSON.parse(text);
-      } catch {
-        data = text;
-      }
-      throw new HttpError(
-        response.status,
-        data,
-        `Upload failed: HTTP ${response.status}`,
-      );
-    }
-
-    const data = (await response.json()) as UploadResponse;
-    if (!data?.url) {
-      throw new HttpError(
-        response.status,
-        data,
-        "Upload response missing 'url' field",
-      );
-    }
-    return data.url;
-  } finally {
-    clearTimeout(timer);
+  if (!data?.url) {
+    throw new HttpError(200, data, "Upload response missing 'url' field");
   }
+  return data.url;
 }

@@ -116,7 +116,7 @@ export default function App() {
     setLoadingMore(true);
     try {
       const older = await fetchHistoryMessages(THREAD_ID, {
-        before: historyCursor,
+        cursor: historyCursor,
         limit: HISTORY_PAGE_SIZE,
       });
       if (older.length === 0) {
