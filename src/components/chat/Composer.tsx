@@ -36,6 +36,10 @@ export function Composer({
   const hasReadyAttachment = attachments.some(
     (item) => item.status === "success" && item.url,
   );
+  // 有任意附件还在上传中 → 禁掉发送, 否则 handleSend 里
+  // attachments.filter(it => it.status === "success" && it.url) 会把它过滤掉,
+  // 发出只含文本的消息(图片丢失)
+  const hasUploading = attachments.some((item) => item.status === "progress");
 
   return (
     <ChatSender
@@ -44,7 +48,9 @@ export function Composer({
       placeholder="发消息…"
       actions={["attachment", "send"]}
       autosize={{ minRows: 1, maxRows: 8 }}
-      readyToSend={(v) => v.trim().length > 0 || hasReadyAttachment}
+      readyToSend={(v) =>
+        !hasUploading && (v.trim().length > 0 || hasReadyAttachment)
+      }
       onChange={(e) => onChange(e.detail)}
       onSend={(e: CustomEvent<TdChatSenderParams>) => {
         onSend(e.detail.value);
