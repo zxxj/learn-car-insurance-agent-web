@@ -36,17 +36,18 @@ export async function fetchHistoryMessages(
   threadId: string,
   options: FetchHistoryOptions = {},
 ): Promise<AGUIHistoryMessage[]> {
-  const params = new URLSearchParams();
-  params.set("conversation_id", threadId);
-  if (options.cursor) params.set("cursor", options.cursor);
-  if (options.limit !== undefined) {
-    params.set("limit", String(options.limit));
-  }
-  const url = `${MESSAGES_ENDPOINTS.list()}${`?${params.toString()}`}`;
-
-  const data = await http<MessagesSnapshot | AGUIHistoryMessage[]>(url, {
-    method: "GET",
-  });
+  // axios 会自动序列化 params, 并跳过 undefined 值
+  const data = await http<MessagesSnapshot | AGUIHistoryMessage[]>(
+    MESSAGES_ENDPOINTS.list(),
+    {
+      method: "GET",
+      params: {
+        conversation_id: threadId,
+        cursor: options.cursor,
+        limit: options.limit,
+      },
+    },
+  );
   // 兼容两种返回结构:包一层 / 直接是数组
   if (Array.isArray(data)) return data;
   return data?.messages ?? [];
